@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix, accuracy_score, cohen_kappa_score
 
 # 导入预处理模块
-from preprocess import get_data
+from preprocess import get_data, EEGDataset
 
 # 设置设备
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -86,7 +86,7 @@ def draw_performance_barChart(num_sub, metric, label, results_path):
     plt.close()
 
 # 训练函数
-def train(model, train_loader, val_loader, criterion, optimizer, epochs, patience):
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs, patience):
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     best_val_acc = 0
     counter = 0
@@ -134,13 +134,16 @@ def train(model, train_loader, val_loader, criterion, optimizer, epochs, patienc
         val_acc = correct / total
         val_loss /= len(val_loader)
         
+        # 学习率衰减
+        scheduler.step(val_loss)
+        
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
         
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # 早停逻辑
         if val_acc > best_val_acc:
@@ -181,21 +184,21 @@ def test(model, test_loader):
 def run():
     # 配置
     dataset_path = "./dataset/2a/"  # 数据集路径
-    results_path = "./results"
+    results_path = "./results_improved"  # 改进版结果路径
     # 创建必要的目录
     os.makedirs(results_path, exist_ok=True)
     os.makedirs(f"{results_path}/saved_models", exist_ok=True)
     os.makedirs(f"{results_path}/metrics", exist_ok=True)  # 保存指标的目录
     
-    # 超参数
-    batch_size = 64
+    # 优化后的超参数
+    batch_size = 32  # 减小批大小提高泛化性
     epochs = 500
-    patience = 300
-    lr = 0.0009  # NCP推荐学习率
+    patience = 100  # 缩短早停 patience
+    lr = 0.0005  # 调整学习率
     n_subjects = 9
     n_train_runs = 10
     
-    # 导入NCP模型
+    # 导入改进的NCP模型
     from models import EEG_NCPNet
     
     # 保存结果的日志文件
@@ -210,14 +213,14 @@ def run():
         print(f"\nTraining on subject {sub + 1}")
         log_file.write(f"\nTraining on subject {sub + 1}\n")
         
-        # 获取数据
+        # 获取数据（启用多频段滤波）
         X_train, y_train, X_test, y_test = get_data(
-            dataset_path, sub, loso=False, is_standard=True, fre_filter=False, dataset='BCI2a'
+            dataset_path, sub, loso=False, is_standard=True, fre_filter=True, dataset='BCI2a'
         )
         
-        # 创建数据加载器
-        train_dataset = TensorDataset(X_train, y_train)
-        test_dataset = TensorDataset(X_test, y_test)
+        # 创建增强版数据集
+        train_dataset = EEGDataset(X_train, y_train, training=True, augment_prob=0.3)
+        test_dataset = EEGDataset(X_test, y_test, training=False)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
         
@@ -229,13 +232,19 @@ def run():
             start_time = time.time()
             print(f"Run {run + 1}/{n_train_runs}")
             
-            # 初始化模型、损失函数和优化器
-            model = EEG_NCPNet(nb_classes=4, Chans=22, Samples=1125).to(device)
+            # 初始化模型（适配多频段）
+            model = EEG_NCPNet(nb_classes=4, Chans=22, Samples=1125, n_bands=9).to(device)
             criterion = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(model.parameters(), lr=lr)
+            optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)  # 添加权重衰减
+            # 学习率衰减策略
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=20
+            )
             
             # 训练
-            trained_model, history = train(model, train_loader, test_loader, criterion, optimizer, epochs, patience)
+            trained_model, history = train(
+                model, train_loader, test_loader, criterion, optimizer, scheduler, epochs, patience
+            )
             
             # 测试
             acc_val, kappa_val, _, _, _ = test(trained_model, test_loader)
@@ -315,14 +324,14 @@ def run():
         best_run = best_runs[sub]
         model_path = f"{results_path}/saved_models/best_subj_{sub+1}_run_{best_run+1}.pth"
         
-        model = EEG_NCPNet(nb_classes=4, Chans=22, Samples=1125).to(device)
+        model = EEG_NCPNet(nb_classes=4, Chans=22, Samples=1125, n_bands=9).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device))
         
         # 获取测试数据
         _, _, X_test, y_test = get_data(
-            dataset_path, sub, loso=False, is_standard=True, fre_filter=False, dataset='BCI2a'
+            dataset_path, sub, loso=False, is_standard=True, fre_filter=True, dataset='BCI2a'
         )
-        test_dataset = TensorDataset(X_test, y_test)
+        test_dataset = EEGDataset(X_test, y_test, training=False)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
         
         # 测试

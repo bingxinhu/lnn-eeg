@@ -154,7 +154,45 @@ def bandpass_filter(data, bandFiltCutF, fs, filtOrder=50, axis=1, filtType='filt
     return data_out
 
 
-def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=False, dataset='BCI2a'):
+class EEGDataset(torch.utils.data.Dataset):
+    """增强版数据集，支持数据增强"""
+    def __init__(self, X, y, training=False, augment_prob=0.3):
+        self.X = X
+        self.y = y
+        self.training = training
+        self.augment_prob = augment_prob  # 增强概率
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        x = self.X[idx]
+        y = self.y[idx]
+
+        if self.training and np.random.rand() < self.augment_prob:
+            # 数据增强：时间抖动（±50ms）
+            if x.ndim == 4:  # 多频段数据 (1, bands, chans, time)
+                time_dim = -1
+            else:  # 单频段数据 (1, chans, time)
+                time_dim = -1
+            
+            shift = np.random.randint(-12, 13)  # 250Hz下±50ms对应±12.5个样本点
+            if shift != 0:
+                x = torch.roll(x, shift, dims=time_dim)
+                # 边缘填充0
+                if shift > 0:
+                    x[..., :shift] = 0
+                else:
+                    x[..., shift:] = 0
+
+            # 加性高斯噪声
+            noise = torch.randn_like(x) * 0.01
+            x = x + noise
+
+        return x, y
+
+
+def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=True, dataset='BCI2a'):
     """获取预处理后的数据（返回PyTorch张量）"""
     if dataset == 'BCI2a':
         fs = 250
