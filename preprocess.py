@@ -13,7 +13,6 @@ def load_data_BCI2a(data_path, subject, training):
     data_list = []
     label_list = []
 
-    # 加载MAT文件
     if training:
         a = io.loadmat(f"{data_path}A0{subject}T.mat")
     else:
@@ -31,12 +30,10 @@ def load_data_BCI2a(data_path, subject, training):
 
         for trial in range(a_trial.size):
             if a_artifacts[trial] == 0:  # 排除有伪影的试次
-                start_idx = int(a_trial[trial].item())  # 转换为标量
+                start_idx = int(a_trial[trial].item())
                 end_idx = start_idx + window_length
-                # 提取数据并转置为(通道, 时间点)
                 eeg_data = np.transpose(a_X[start_idx:end_idx, :n_channels])
                 data_list.append(eeg_data)
-                # 标签从0开始（原始标签1-4）
                 label_list.append(int(a_y[trial].item()) - 1)
 
     return np.array(data_list), np.array(label_list)
@@ -50,7 +47,6 @@ def load_data_BCI2b(data_path, subject, training):
     data_list = []
     label_list = []
 
-    # 加载MAT文件
     if training:
         a = io.loadmat(f"{data_path}B0{subject}T.mat")
     else:
@@ -68,12 +64,10 @@ def load_data_BCI2b(data_path, subject, training):
 
         for trial in range(a_trial.size):
             if a_artifacts[trial] == 0:  # 排除有伪影的试次
-                start_idx = int(a_trial[trial].item())  # 转换为标量
+                start_idx = int(a_trial[trial].item())
                 end_idx = start_idx + window_length
-                # 提取数据并转置为(通道, 时间点)
                 eeg_data = np.transpose(a_X[start_idx:end_idx, :n_channels])
                 data_list.append(eeg_data)
-                # 标签从0开始（原始标签1-2）
                 label_list.append(int(a_y[trial].item()) - 1)
 
     return np.array(data_list), np.array(label_list)
@@ -92,7 +86,6 @@ def load_data_loso(data_path, subject, dataset='BCI2a'):
             x1, y1 = load_data_BCI2b(data_path, sub, True)
             x2, y2 = load_data_BCI2b(data_path, sub, False)
         
-        # 合并训练和测试数据
         x = np.concatenate((x1, x2), axis=0)
         y = np.concatenate((y1, y2), axis=0)
 
@@ -109,17 +102,13 @@ def load_data_loso(data_path, subject, dataset='BCI2a'):
 
 def standardize_data(X_train, X_test, channels):
     """标准化数据（按通道）"""
-    # 输入形状: (n_samples, 1, n_channels, n_timepoints)
     for j in range(channels):
         scaler = StandardScaler()
-        # 提取训练集第j通道数据并拟合
         train_data = X_train[:, 0, j, :].reshape(-1, 1)
         scaler.fit(train_data)
-        # 标准化训练集
         X_train[:, 0, j, :] = scaler.transform(
             X_train[:, 0, j, :].reshape(-1, 1)
         ).reshape(X_train.shape[0], X_train.shape[3])
-        # 标准化测试集（使用训练集的均值和标准差）
         X_test[:, 0, j, :] = scaler.transform(
             X_test[:, 0, j, :].reshape(-1, 1)
         ).reshape(X_test.shape[0], X_test.shape[3])
@@ -155,14 +144,14 @@ def bandpass_filter(data, bandFiltCutF, fs, filtOrder=50, axis=1, filtType='filt
 
 
 class EEGDataset(torch.utils.data.Dataset):
-    """增强版数据集，支持数据增强"""
-    def __init__(self, X, y, training=False, augment_prob=0.3):
+    def __init__(self, X, y, training=False, augment_prob=0.8):  # 提高增强概率
         self.X = X
         self.y = y
         self.training = training
-        self.augment_prob = augment_prob  # 增强概率
+        self.augment_prob = augment_prob
 
     def __len__(self):
+        """返回数据集样本数量，供DataLoader使用"""
         return len(self.X)
 
     def __getitem__(self, idx):
@@ -170,26 +159,62 @@ class EEGDataset(torch.utils.data.Dataset):
         y = self.y[idx]
 
         if self.training and np.random.rand() < self.augment_prob:
-            # 数据增强：时间抖动（±50ms）
-            if x.ndim == 4:  # 多频段数据 (1, bands, chans, time)
-                time_dim = -1
-            else:  # 单频段数据 (1, chans, time)
-                time_dim = -1
+            # 1. 更强的数据增强
+            # 时间扭曲
+            if np.random.rand() < 0.5:
+                x = self.time_warp(x)
             
-            shift = np.random.randint(-12, 13)  # 250Hz下±50ms对应±12.5个样本点
-            if shift != 0:
-                x = torch.roll(x, shift, dims=time_dim)
-                # 边缘填充0
-                if shift > 0:
-                    x[..., :shift] = 0
-                else:
-                    x[..., shift:] = 0
-
-            # 加性高斯噪声
-            noise = torch.randn_like(x) * 0.01
-            x = x + noise
-
+            # 2. 通道丢弃（更激进）
+            if np.random.rand() < 0.4:
+                n_channels_to_drop = int(x.shape[1] * 0.3)  # 丢弃30%通道
+                channels_to_drop = np.random.choice(
+                    x.shape[1], n_channels_to_drop, replace=False
+                )
+                x[:, channels_to_drop, :] = 0
+            
+            # 3. 频谱掩码
+            if np.random.rand() < 0.3:
+                x = self.frequency_mask(x)
+                
         return x, y
+    
+    def time_warp(self, x, max_warp=0.2):
+        """时间扭曲增强"""
+        batch_size, channels, time_steps = x.shape
+        warp_factor = 1 + np.random.uniform(-max_warp, max_warp)
+        new_length = int(time_steps * warp_factor)
+        
+        # 重采样
+        x_warped = torch.zeros(batch_size, channels, new_length)
+        for i in range(channels):
+            original_signal = x[0, i, :].numpy()
+            resampled_signal = signal.resample(original_signal, new_length)
+            x_warped[0, i, :] = torch.FloatTensor(resampled_signal)
+        
+        # 截断或填充到原始长度
+        if new_length > time_steps:
+            return x_warped[:, :, :time_steps]
+        else:
+            result = torch.zeros(batch_size, channels, time_steps)
+            result[:, :, :new_length] = x_warped
+            return result
+    
+    def frequency_mask(self, x, max_mask_fraction=0.2):
+        """频率域掩码"""
+        # FFT变换
+        x_fft = torch.fft.fft(x, dim=-1)
+        
+        # 随机掩码部分频率
+        mask_length = int(x.shape[-1] * max_mask_fraction * np.random.rand())
+        mask_start = np.random.randint(0, x.shape[-1] - mask_length)
+        
+        # 应用掩码
+        x_fft_masked = x_fft.clone()
+        x_fft_masked[..., mask_start:mask_start+mask_length] = 0
+        
+        # 逆FFT
+        x_masked = torch.fft.ifft(x_fft_masked, dim=-1).real
+        return x_masked
 
 
 def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=True, dataset='BCI2a'):
@@ -232,7 +257,6 @@ def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=True, 
     if fre_filter:
         filt_banks = [[4, 8], [8, 12], [12, 16], [16, 20], 
                      [20, 24], [24, 28], [28, 32], [32, 36], [36, 40]]
-        # 初始化多频段数据存储
         X_train_temp = np.zeros(X_train.shape + (len(filt_banks),))
         X_test_temp = np.zeros(X_test.shape + (len(filt_banks),))
         
@@ -246,7 +270,7 @@ def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=True, 
 
     # 转换为PyTorch张量
     X_train = torch.FloatTensor(X_train)
-    y_train = torch.LongTensor(y_train)  # 类别标签（非独热编码）
+    y_train = torch.LongTensor(y_train)
     X_test = torch.FloatTensor(X_test)
     y_test = torch.LongTensor(y_test)
 
