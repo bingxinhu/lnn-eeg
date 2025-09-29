@@ -544,7 +544,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=32, help='批处理大小')  # 减小batch size
     parser.add_argument('--epochs', type=int, default=300, help='最大训练轮次')  # 增加epochs
     parser.add_argument('--patience', type=int, default=80, help='早停耐心值')  # 增加耐心值
-    parser.add_argument('--lr', type=float, default=5e-4, help='初始学习率')  # 降低学习率
+    parser.add_argument('--lr', type=float, default=5e-3, help='初始学习率')  # 降低学习率
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='权重衰减')  # 增加权重衰减
     parser.add_argument('--label_smoothing', type=float, default=0.2, help='标签平滑系数')  # 增加标签平滑
     parser.add_argument('--n_subjects', type=int, default=9, help='被试数量')
