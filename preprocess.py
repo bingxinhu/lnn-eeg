@@ -3,6 +3,7 @@ import scipy.signal as signal
 import torch
 from scipy import io
 from sklearn.preprocessing import StandardScaler
+import mne  # 用于更专业的EEG处理
 
 
 def load_data_BCI2a(data_path, subject, training):
@@ -115,43 +116,43 @@ def standardize_data(X_train, X_test, channels):
     return X_train, X_test
 
 
-def bandpass_filter(data, bandFiltCutF, fs, filtOrder=50, axis=1, filtType='filter'):
-    """带通滤波器"""
+def bandpass_filter(data, bandFiltCutF, fs, filtOrder=50, axis=1, filtType='filtfilt'):
+    """改进的带通滤波器，使用MNE的专业滤波实现"""
     if (bandFiltCutF[0] in (0, None)) and (bandFiltCutF[1] in (None, fs/2.0)):
         print("不进行滤波（无效的截止频率设置）")
         return data
     
-    # 设计FIR滤波器
-    if bandFiltCutF[0] in (0, None):
-        print(f"应用低通滤波（截止频率: {bandFiltCutF[1]}Hz）")
-        h = signal.firwin(filtOrder + 1, cutoff=bandFiltCutF[1], 
-                         pass_zero="lowpass", fs=fs)
-    elif bandFiltCutF[1] in (None, fs/2.0):
-        print(f"应用高通滤波（截止频率: {bandFiltCutF[0]}Hz）")
-        h = signal.firwin(filtOrder + 1, cutoff=bandFiltCutF[0], 
-                         pass_zero="highpass", fs=fs)
-    else:
-        print(f"应用带通滤波（{bandFiltCutF[0]}-{bandFiltCutF[1]}Hz）")
-        h = signal.firwin(filtOrder + 1, cutoff=bandFiltCutF, 
-                         pass_zero="bandpass", fs=fs)
+    # 转换为MNE的Raw对象进行滤波
+    n_channels = data.shape[1] if axis == 2 else data.shape[-2]
+    ch_names = [f'EEG{i}' for i in range(n_channels)]
+    info = mne.create_info(ch_names=ch_names, sfreq=fs, ch_types='eeg')
     
-    # 应用滤波
-    if filtType == 'filtfilt':
-        data_out = signal.filtfilt(h, [1], data, axis=axis)
+    # 调整数据形状为 (n_channels, n_times)
+    if data.ndim == 4:  # (samples, 1, chans, times)
+        data_reshaped = data[:, 0, :, :].transpose(1, 0, 2).reshape(n_channels, -1)
     else:
-        data_out = signal.lfilter(h, [1], data, axis=axis)
-    return data_out
+        data_reshaped = data.transpose(1, 0, 2).reshape(n_channels, -1)
+    
+    raw = mne.io.RawArray(data_reshaped, info)
+    raw.filter(bandFiltCutF[0], bandFiltCutF[1], fir_design='firwin', l_trans_bandwidth=1, h_trans_bandwidth=1)
+    
+    # 恢复原始形状
+    filtered_data = raw.get_data().reshape(n_channels, -1, data.shape[-1]).transpose(1, 0, 2)
+    if data.ndim == 4:
+        filtered_data = filtered_data[:, np.newaxis, :, :]
+    
+    return filtered_data
 
 
 class EEGDataset(torch.utils.data.Dataset):
-    def __init__(self, X, y, training=False, augment_prob=0.8):  # 提高增强概率
+    def __init__(self, X, y, training=False, augment_prob=0.5):
         self.X = X
         self.y = y
         self.training = training
         self.augment_prob = augment_prob
+        self.fs = 250  # 采样率
 
     def __len__(self):
-        """返回数据集样本数量，供DataLoader使用"""
         return len(self.X)
 
     def __getitem__(self, idx):
@@ -159,24 +160,26 @@ class EEGDataset(torch.utils.data.Dataset):
         y = self.y[idx]
 
         if self.training and np.random.rand() < self.augment_prob:
-            # 1. 更强的数据增强
-            # 时间扭曲
-            if np.random.rand() < 0.5:
-                x = self.time_warp(x)
+            # 选择1-2种增强方法，避免过度增强
+            augment_methods = [
+                self.add_noise,
+                self.time_warp, 
+                self.random_scale,
+                self.random_shift
+            ]
+            # 随机选择1-2种增强
+            num_augments = np.random.randint(1, 3)
+            selected_augments = np.random.choice(augment_methods, num_augments, replace=False)
             
-            # 2. 通道丢弃（更激进）
-            if np.random.rand() < 0.4:
-                n_channels_to_drop = int(x.shape[1] * 0.3)  # 丢弃30%通道
-                channels_to_drop = np.random.choice(
-                    x.shape[1], n_channels_to_drop, replace=False
-                )
-                x[:, channels_to_drop, :] = 0
-            
-            # 3. 频谱掩码
-            if np.random.rand() < 0.3:
-                x = self.frequency_mask(x)
-                
+            for augment in selected_augments:
+                x = augment(x)
+        
         return x, y
+    
+    def add_noise(self, x, noise_level=0.02):
+        """添加高斯噪声"""
+        noise = torch.randn_like(x) * noise_level
+        return x + noise
     
     def time_warp(self, x, max_warp=0.2):
         """时间扭曲增强"""
@@ -184,14 +187,12 @@ class EEGDataset(torch.utils.data.Dataset):
         warp_factor = 1 + np.random.uniform(-max_warp, max_warp)
         new_length = int(time_steps * warp_factor)
         
-        # 重采样
         x_warped = torch.zeros(batch_size, channels, new_length)
         for i in range(channels):
             original_signal = x[0, i, :].numpy()
             resampled_signal = signal.resample(original_signal, new_length)
             x_warped[0, i, :] = torch.FloatTensor(resampled_signal)
         
-        # 截断或填充到原始长度
         if new_length > time_steps:
             return x_warped[:, :, :time_steps]
         else:
@@ -201,20 +202,44 @@ class EEGDataset(torch.utils.data.Dataset):
     
     def frequency_mask(self, x, max_mask_fraction=0.2):
         """频率域掩码"""
-        # FFT变换
         x_fft = torch.fft.fft(x, dim=-1)
-        
-        # 随机掩码部分频率
         mask_length = int(x.shape[-1] * max_mask_fraction * np.random.rand())
         mask_start = np.random.randint(0, x.shape[-1] - mask_length)
-        
-        # 应用掩码
         x_fft_masked = x_fft.clone()
         x_fft_masked[..., mask_start:mask_start+mask_length] = 0
+        return torch.fft.ifft(x_fft_masked, dim=-1).real
+    
+    def channel_dropout(self, x, drop_prob=0.3):
+        """通道丢弃增强"""
+        n_channels = x.shape[1]
+        n_channels_to_drop = int(n_channels * drop_prob)
+        if n_channels_to_drop > 0:
+            channels_to_drop = np.random.choice(n_channels, n_channels_to_drop, replace=False)
+            x[:, channels_to_drop, :] = 0
+        return x
+    
+    def random_scale(self, x, scale_range=(0.8, 1.2)):
+        """随机缩放增强"""
+        scale_factor = np.random.uniform(scale_range[0], scale_range[1])
+        return x * scale_factor
+    
+    def random_shift(self, x, max_shift=0.1):
+        """随机时间移位增强"""
+        batch_size, channels, time_steps = x.shape
+        shift = int(time_steps * np.random.uniform(-max_shift, max_shift))
         
-        # 逆FFT
-        x_masked = torch.fft.ifft(x_fft_masked, dim=-1).real
-        return x_masked
+        if shift > 0:
+            # 向右移位
+            shifted = torch.zeros_like(x)
+            shifted[:, :, shift:] = x[:, :, :-shift]
+        elif shift < 0:
+            # 向左移位
+            shifted = torch.zeros_like(x)
+            shifted[:, :, :shift] = x[:, :, -shift:]
+        else:
+            shifted = x
+            
+        return shifted
 
 
 def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=True, dataset='BCI2a'):
