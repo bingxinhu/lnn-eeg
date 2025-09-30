@@ -4,7 +4,7 @@ import json
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-plt.switch_backend('Agg')  # 使用Agg后端，适用于非交互式环境
+plt.switch_backend('Agg')
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,17 +18,15 @@ from preprocess import get_data, EEGDataset
 
 # 设置中文字体支持
 plt.rcParams["font.family"] = ["SimHei", "WenQuanYi Micro Hei", "Heiti TC"]
-plt.rcParams["axes.unicode_minus"] = False  # 解决负号显示问题
+plt.rcParams["axes.unicode_minus"] = False
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {device}")
-
 
 def draw_learning_curves(history, sub, run, results_path):
     """绘制并保存学习曲线"""
     os.makedirs(f"{results_path}/learning_curves", exist_ok=True)
     
-    # 准确率曲线
     plt.figure(figsize=(10, 6))
     plt.plot(history['train_acc'], label='训练准确率')
     plt.plot(history['val_acc'], label='验证准确率')
@@ -40,7 +38,6 @@ def draw_learning_curves(history, sub, run, results_path):
     plt.savefig(f"{results_path}/learning_curves/subj_{sub+1}_run_{run+1}_acc.png", dpi=300)
     plt.close()
     
-    # 损失曲线
     plt.figure(figsize=(10, 6))
     plt.plot(history['train_loss'], label='训练损失')
     plt.plot(history['val_loss'], label='验证损失')
@@ -51,7 +48,6 @@ def draw_learning_curves(history, sub, run, results_path):
     plt.grid(alpha=0.3)
     plt.savefig(f"{results_path}/learning_curves/subj_{sub+1}_run_{run+1}_loss.png", dpi=300)
     plt.close()
-
 
 def draw_confusion_matrix(cf_matrix, name, results_path, display_labels=None):
     """绘制并保存混淆矩阵"""
@@ -65,7 +61,6 @@ def draw_confusion_matrix(cf_matrix, name, results_path, display_labels=None):
     plt.xticks(np.arange(cf_matrix.shape[1]), display_labels, rotation=15)
     plt.yticks(np.arange(cf_matrix.shape[0]), display_labels)
     
-    # 在混淆矩阵中标记数值
     thresh = cf_matrix.max() / 2.
     for i in range(cf_matrix.shape[0]):
         for j in range(cf_matrix.shape[1]):
@@ -82,7 +77,6 @@ def draw_confusion_matrix(cf_matrix, name, results_path, display_labels=None):
     plt.savefig(f"{results_path}/confusion_matrices/cf_{name}.png", dpi=360)
     plt.close()
 
-
 def draw_performance_barChart(num_sub, metric, label, results_path):
     """绘制性能指标条形图"""
     os.makedirs(f"{results_path}/performance_plots", exist_ok=True)
@@ -91,7 +85,6 @@ def draw_performance_barChart(num_sub, metric, label, results_path):
     x = list(range(1, num_sub + 1))
     bars = plt.bar(x, metric, 0.5, label=label)
     
-    # 在柱状图上标注数值
     for bar in bars:
         height = bar.get_height()
         plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
@@ -107,39 +100,14 @@ def draw_performance_barChart(num_sub, metric, label, results_path):
     plt.savefig(f"{results_path}/performance_plots/{label.lower()}_bar.png", dpi=300)
     plt.close()
 
-
-def check_gradients(model):
-    """检查梯度范数"""
-    total_norm = 0
-    for p in model.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** (1. / 2)
-    return total_norm
-
-
-def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs, patience, device, lr):
-    """模型训练函数，支持混合精度训练和warmup"""
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs, patience, device):
+    """改进的训练函数"""
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     best_val_acc = 0.0
     counter = 0
     best_model_weights = None
     
-    # 混合精度训练
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
-    
-    # Warmup设置
-    warmup_epochs = 10
-    accumulation_steps = 2  # 梯度累积步数
-    
     for epoch in range(epochs):
-        # Warmup学习率调整
-        if epoch < warmup_epochs:
-            lr_scale = min(1.0, float(epoch + 1) / warmup_epochs)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr * lr_scale
-        
         # 训练阶段
         model.train()
         train_loss = 0.0
@@ -147,63 +115,29 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
         total = 0
         
         train_pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{epochs} 训练", leave=False)
-        optimizer.zero_grad()
         
         for batch_idx, (inputs, labels) in enumerate(train_pbar):
             inputs, labels = inputs.to(device), labels.to(device)
             
-            # 混合精度训练
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels) / accumulation_steps
-                scaler.scale(loss).backward()
-            else:
-                outputs = model(inputs)
-                loss = criterion(outputs, labels) / accumulation_steps
-                loss.backward()
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
             
-            train_loss += loss.item() * inputs.size(0) * accumulation_steps
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            train_loss += loss.item() * inputs.size(0)
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             
-            # 梯度累积更新
-            if (batch_idx + 1) % accumulation_steps == 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                optimizer.zero_grad()
-            
-            # 更新进度条
             current_acc = correct / total
-            train_pbar.set_postfix({"损失": f"{loss.item():.4f}", "准确率": f"{current_acc:.4f}"})
-            
-            # 每50个batch检查一次梯度
-            if batch_idx % 50 == 0:
-                grad_norm = check_gradients(model)
-                train_pbar.set_postfix({
-                    "损失": f"{loss.item():.4f}", 
-                    "准确率": f"{current_acc:.4f}",
-                    "梯度": f"{grad_norm:.4f}"
-                })
-        
-        # 处理剩余的梯度
-        if len(train_loader) % accumulation_steps != 0:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            optimizer.zero_grad()
+            train_pbar.set_postfix({
+                "损失": f"{loss.item():.4f}", 
+                "准确率": f"{current_acc:.4f}"
+            })
         
         train_acc = correct / total
         train_loss /= total
@@ -218,33 +152,26 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
             val_pbar = tqdm(val_loader, desc=f"轮次 {epoch+1}/{epochs} 验证", leave=False)
             for inputs, labels in val_pbar:
                 inputs, labels = inputs.to(device), labels.to(device)
-                
-                if scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        outputs = model(inputs)
-                        loss = criterion(outputs, labels)
-                else:
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
                 
                 val_loss += loss.item() * inputs.size(0)
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
                 
-                # 更新进度条
                 current_val_acc = correct / total
-                val_pbar.set_postfix({"损失": f"{loss.item():.4f}", "准确率": f"{current_val_acc:.4f}"})
+                val_pbar.set_postfix({
+                    "损失": f"{loss.item():.4f}", 
+                    "准确率": f"{current_val_acc:.4f}"
+                })
         
         val_acc = correct / total
         val_loss /= total
         
-        # 更新学习率调度器（只在warmup后）
-        if epoch >= warmup_epochs:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
+        # 更新学习率
+        if scheduler is not None:
+            scheduler.step()
         
         # 记录训练历史
         history['train_loss'].append(train_loss)
@@ -258,7 +185,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
               f"验证损失: {val_loss:.4f} | 验证准确率: {val_acc:.4f} | 学习率: {current_lr:.6f}")
         
         # 早停机制
-        min_delta = 0.002  # 最小改进阈值
+        min_delta = 0.001
         if val_acc > best_val_acc + min_delta:
             best_val_acc = val_acc
             best_model_weights = model.state_dict()
@@ -274,9 +201,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
         model.load_state_dict(best_model_weights)
     return model, history
 
-
 def test(model, test_loader, device):
-    """模型测试函数，返回评估指标"""
+    """模型测试函数"""
     model.eval()
     all_preds = []
     all_labels = []
@@ -292,11 +218,10 @@ def test(model, test_loader, device):
     
     acc = accuracy_score(all_labels, all_preds)
     kappa = cohen_kappa_score(all_labels, all_preds)
-    cf_matrix = confusion_matrix(all_labels, all_preds, normalize='true')  # 按真实标签归一化
+    cf_matrix = confusion_matrix(all_labels, all_preds, normalize='true')
     class_report = classification_report(all_labels, all_preds, output_dict=True)
     
     return acc, kappa, cf_matrix, class_report, all_labels, all_preds
-
 
 def get_model(model_name, nb_classes=4, Chans=22, Samples=1125, n_bands=9):
     """根据模型名称获取对应的模型实例"""
@@ -311,9 +236,8 @@ def get_model(model_name, nb_classes=4, Chans=22, Samples=1125, n_bands=9):
     else:
         raise ValueError(f"未知模型: {model_name}")
 
-
 def run(args):
-    """主运行函数，控制整个实验流程"""
+    """主运行函数"""
     # 配置参数
     dataset_path = args.dataset_path
     results_path = f"./results_{args.model}"
@@ -321,18 +245,17 @@ def run(args):
     os.makedirs(f"{results_path}/saved_models", exist_ok=True)
     os.makedirs(f"{results_path}/metrics", exist_ok=True)
     
-    # 超参数设置 - 优化后的参数
+    # 超参数设置
     batch_size = args.batch_size
     epochs = args.epochs
     patience = args.patience
     lr = args.lr
     n_subjects = args.n_subjects
     n_train_runs = args.n_runs
-    val_split = args.val_split  # 从训练集中划分验证集的比例
+    val_split = args.val_split
     
     # 日志文件
     log_file = open(f"{results_path}/log.txt", "w", encoding="utf-8")
-    # 记录参数配置
     log_file.write("实验参数配置:\n")
     for arg in vars(args):
         log_file.write(f"  {arg}: {getattr(args, arg)}\n")
@@ -343,21 +266,32 @@ def run(args):
     kappa = np.zeros((n_subjects, n_train_runs))
     best_runs = np.zeros(n_subjects, dtype=int)
     
-    # 数据缓存字典，避免重复加载
+    # 数据缓存字典
     data_cache = {}
     
     for sub in range(n_subjects):
         print(f"\n正在训练被试 {sub + 1}")
         log_file.write(f"\n正在训练被试 {sub + 1}\n")
         
-        # 加载数据（使用缓存）
+        # 加载数据 - 确保使用9个频段
         if sub not in data_cache:
             X_train, y_train, X_test, y_test = get_data(
-                dataset_path, sub, loso=True, is_standard=True, fre_filter=True, dataset='BCI2a'
+                dataset_path, sub, loso=True, is_standard=True, 
+                fre_filter=True, dataset='BCI2a', use_9_bands=True  # 确保使用9个频段
             )
             data_cache[sub] = (X_train, y_train, X_test, y_test)
         else:
             X_train, y_train, X_test, y_test = data_cache[sub]
+        
+        # 获取实际的频段数量
+        n_bands_actual = X_train.shape[1]
+        print(f"实际频段数量: {n_bands_actual}")
+        print(f"X_train形状: {X_train.shape}")
+        print(f"X_test形状: {X_test.shape}")
+        
+        # 检查数据平衡性
+        unique, counts = np.unique(y_train.numpy(), return_counts=True)
+        print(f"训练集类别分布: {dict(zip(unique, counts))}")
         
         # 划分训练集和验证集
         train_size = int((1 - val_split) * len(X_train))
@@ -371,7 +305,7 @@ def run(args):
         test_dataset = EEGDataset(X_test, y_test, training=False)
         
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                                 num_workers=args.num_workers, pin_memory=True)
+                                 num_workers=args.num_workers, pin_memory=True, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
                                num_workers=args.num_workers, pin_memory=True)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
@@ -384,19 +318,19 @@ def run(args):
             start_time = time.time()
             print(f"第 {run + 1}/{n_train_runs} 次运行")
             
-            # 初始化模型、损失函数和优化器
-            model = get_model(args.model, nb_classes=4, Chans=22, Samples=1125, n_bands=9).to(device)
+            # 使用实际的频段数量初始化模型
+            model = get_model(args.model, nb_classes=4, Chans=22, Samples=1125, n_bands=n_bands_actual).to(device)
             criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
             optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
             
             # 使用余弦退火学习率调度
             scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=epochs - 10, eta_min=1e-6  # 减去warmup轮次
+                optimizer, T_max=epochs, eta_min=1e-6
             )
             
             # 训练模型
             trained_model, history = train(
-                model, train_loader, val_loader, criterion, optimizer, scheduler, epochs, patience, device, lr
+                model, train_loader, val_loader, criterion, optimizer, scheduler, epochs, patience, device
             )
             
             # 在测试集上评估
@@ -404,7 +338,7 @@ def run(args):
             acc[sub, run] = acc_val
             kappa[sub, run] = kappa_val
             
-            run_time = (time.time() - start_time) / 60  # 分钟
+            run_time = (time.time() - start_time) / 60
             
             # 保存运行指标
             run_metrics = {
@@ -475,12 +409,15 @@ def run(args):
         best_run = best_runs[sub]
         model_path = f"{results_path}/saved_models/best_subj_{sub+1}_run_{best_run+1}.pth"
         
-        # 加载最佳模型
-        model = get_model(args.model, nb_classes=4, Chans=22, Samples=1125, n_bands=9).to(device)
+        # 获取该被试的实际频段数量
+        _, _, X_test, y_test = data_cache[sub]
+        n_bands_actual = X_test.shape[1]
+        
+        # 加载最佳模型 - 使用正确的频段数量
+        model = get_model(args.model, nb_classes=4, Chans=22, Samples=1125, n_bands=n_bands_actual).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device))
         
         # 获取测试数据
-        _, _, X_test, y_test = data_cache[sub]
         test_dataset = EEGDataset(X_test, y_test, training=False)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
         
@@ -532,7 +469,6 @@ def run(args):
     log_file.close()
     print("所有实验已成功完成!")
 
-
 def parse_args():
     """解析命令行参数 - 优化版本"""
     parser = argparse.ArgumentParser(description='EEG分类模型训练与评估')
@@ -541,20 +477,19 @@ def parse_args():
     parser.add_argument('--model', type=str, default="EnhancedEEGNet",
                        choices=["STFNet", "StableEEGNet", "EnhancedEEGNet"],
                        help='选择模型')
-    parser.add_argument('--batch_size', type=int, default=32, help='批处理大小')  # 减小batch size
-    parser.add_argument('--epochs', type=int, default=300, help='最大训练轮次')  # 增加epochs
-    parser.add_argument('--patience', type=int, default=80, help='早停耐心值')  # 增加耐心值
-    parser.add_argument('--lr', type=float, default=5e-3, help='初始学习率')  # 降低学习率
-    parser.add_argument('--weight_decay', type=float, default=1e-3, help='权重衰减')  # 增加权重衰减
-    parser.add_argument('--label_smoothing', type=float, default=0.2, help='标签平滑系数')  # 增加标签平滑
+    parser.add_argument('--batch_size', type=int, default=32, help='批处理大小')
+    parser.add_argument('--epochs', type=int, default=150, help='最大训练轮次')
+    parser.add_argument('--patience', type=int, default=30, help='早停耐心值')
+    parser.add_argument('--lr', type=float, default=1e-3, help='初始学习率')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
+    parser.add_argument('--label_smoothing', type=float, default=0.1, help='标签平滑系数')
     parser.add_argument('--n_subjects', type=int, default=9, help='被试数量')
-    parser.add_argument('--n_runs', type=int, default=3, help='每个被试的运行次数')  # 减少运行次数
-    parser.add_argument('--val_split', type=float, default=0.15, help='验证集比例')  # 减小验证集比例
-    parser.add_argument('--augment_prob', type=float, default=0.3, help='数据增强概率')  # 降低增强概率
-    parser.add_argument('--num_workers', type=int, default=2, help='数据加载线程数')  # 减少线程数
+    parser.add_argument('--n_runs', type=int, default=3, help='每个被试的运行次数')
+    parser.add_argument('--val_split', type=float, default=0.2, help='验证集比例')
+    parser.add_argument('--augment_prob', type=float, default=0.2, help='数据增强概率')
+    parser.add_argument('--num_workers', type=int, default=2, help='数据加载线程数')
     
     return parser.parse_args()
-
 
 if __name__ == "__main__":
     args = parse_args()
