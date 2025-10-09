@@ -23,6 +23,35 @@ plt.rcParams["axes.unicode_minus"] = False
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {device}")
 
+class ImprovedEarlyStopping:
+    """改进的早停机制"""
+    def __init__(self, patience=50, min_delta=0.002, window_size=10):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.window_size = window_size
+        self.best_acc = 0
+        self.counter = 0
+        self.acc_history = []
+    
+    def __call__(self, val_acc):
+        self.acc_history.append(val_acc)
+        
+        if len(self.acc_history) > self.window_size:
+            # 计算滑动平均
+            recent_avg = np.mean(self.acc_history[-self.window_size:])
+            if recent_avg > self.best_acc + self.min_delta:
+                self.best_acc = recent_avg
+                self.counter = 0
+                return False
+            else:
+                self.counter += 1
+                return self.counter >= self.patience
+        else:
+            if val_acc > self.best_acc + self.min_delta:
+                self.best_acc = val_acc
+                self.counter = 0
+            return False
+
 def draw_learning_curves(history, sub, run, results_path):
     """绘制并保存学习曲线"""
     os.makedirs(f"{results_path}/learning_curves", exist_ok=True)
@@ -101,11 +130,14 @@ def draw_performance_barChart(num_sub, metric, label, results_path):
     plt.close()
 
 def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epochs, patience, device):
-    """改进的训练函数"""
+    """优化的训练函数"""
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     best_val_acc = 0.0
     counter = 0
     best_model_weights = None
+    
+    # 减少梯度累积步数
+    accumulation_steps = 2
     
     for epoch in range(epochs):
         # 训练阶段
@@ -116,28 +148,37 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
         
         train_pbar = tqdm(train_loader, desc=f"轮次 {epoch+1}/{epochs} 训练", leave=False)
         
+        optimizer.zero_grad()
+        
         for batch_idx, (inputs, labels) in enumerate(train_pbar):
             inputs, labels = inputs.to(device), labels.to(device)
             
-            optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels) / accumulation_steps
             loss.backward()
             
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            # 梯度累积
+            if (batch_idx + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
             
-            train_loss += loss.item() * inputs.size(0)
+            train_loss += loss.item() * inputs.size(0) * accumulation_steps
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             
             current_acc = correct / total
             train_pbar.set_postfix({
-                "损失": f"{loss.item():.4f}", 
+                "损失": f"{loss.item() * accumulation_steps:.4f}", 
                 "准确率": f"{current_acc:.4f}"
             })
+        
+        # 处理剩余的梯度
+        if len(train_loader) % accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
         
         train_acc = correct / total
         train_loss /= total
@@ -184,16 +225,17 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler, epoc
         print(f"轮次 {epoch+1}/{epochs} | 训练损失: {train_loss:.4f} | 训练准确率: {train_acc:.4f} | "
               f"验证损失: {val_loss:.4f} | 验证准确率: {val_acc:.4f} | 学习率: {current_lr:.6f}")
         
-        # 早停机制
-        min_delta = 0.001
+        # 改进的早停机制 - 放宽条件
+        min_delta = 0.001  # 降低阈值
         if val_acc > best_val_acc + min_delta:
             best_val_acc = val_acc
-            best_model_weights = model.state_dict()
+            best_model_weights = model.state_dict().copy()  # 使用copy()
             counter = 0
+            print(f"↑ 新的最佳验证准确率: {val_acc:.4f}")
         else:
             counter += 1
             if counter >= patience:
-                print(f"早停于轮次 {epoch+1}")
+                print(f"早停于轮次 {epoch+1}, 最佳验证准确率: {best_val_acc:.4f}")
                 break
     
     # 加载最佳模型权重
@@ -324,8 +366,8 @@ def run(args):
             optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
             
             # 使用余弦退火学习率调度
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=epochs, eta_min=1e-6
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=50, T_mult=2, eta_min=1e-6
             )
             
             # 训练模型
@@ -470,24 +512,24 @@ def run(args):
     print("所有实验已成功完成!")
 
 def parse_args():
-    """解析命令行参数 - 优化版本"""
+    """优化训练参数"""
     parser = argparse.ArgumentParser(description='EEG分类模型训练与评估')
     parser.add_argument('--dataset_path', type=str, default="./dataset/2a/", 
                        help='数据集路径')
     parser.add_argument('--model', type=str, default="EnhancedEEGNet",
                        choices=["STFNet", "StableEEGNet", "EnhancedEEGNet"],
                        help='选择模型')
-    parser.add_argument('--batch_size', type=int, default=32, help='批处理大小')
-    parser.add_argument('--epochs', type=int, default=150, help='最大训练轮次')
-    parser.add_argument('--patience', type=int, default=30, help='早停耐心值')
-    parser.add_argument('--lr', type=float, default=1e-3, help='初始学习率')
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
-    parser.add_argument('--label_smoothing', type=float, default=0.1, help='标签平滑系数')
+    parser.add_argument('--batch_size', type=int, default=16, help='减少批处理大小')  # 从64减少到32
+    parser.add_argument('--epochs', type=int, default=500, help='增加训练轮次')  # 增加到200
+    parser.add_argument('--patience', type=int, default=80, help='增加早停耐心值')  # 增加到80
+    parser.add_argument('--lr', type=float, default=1e-3, help='增加学习率')  # 增加到1e-3
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='减少权重衰减')  # 减少到1e-4
+    parser.add_argument('--label_smoothing', type=float, default=0.1, help='减少标签平滑')  # 减少到0.1
     parser.add_argument('--n_subjects', type=int, default=9, help='被试数量')
     parser.add_argument('--n_runs', type=int, default=3, help='每个被试的运行次数')
-    parser.add_argument('--val_split', type=float, default=0.2, help='验证集比例')
-    parser.add_argument('--augment_prob', type=float, default=0.2, help='数据增强概率')
-    parser.add_argument('--num_workers', type=int, default=2, help='数据加载线程数')
+    parser.add_argument('--val_split', type=float, default=0.15, help='减少验证集比例')  # 减少到0.15
+    parser.add_argument('--augment_prob', type=float, default=0.5, help='增加数据增强概率')  # 增加到0.5
+    parser.add_argument('--num_workers', type=int, default=4, help='增加数据加载线程数')  # 增加到4
     
     return parser.parse_args()
 

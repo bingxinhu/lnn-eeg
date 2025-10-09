@@ -2,6 +2,7 @@
 import numpy as np
 import scipy.signal as signal
 import torch
+import torch.nn.functional as F
 from scipy import io
 from sklearn.preprocessing import StandardScaler
 import mne
@@ -131,14 +132,21 @@ def bandpass_filter(data, bandFiltCutF, fs, filtOrder=4):
     return filtered_data
 
 class EEGDataset(torch.utils.data.Dataset):
-    def __init__(self, X, y, training=False, augment_prob=0.2):
+    def __init__(self, X, y, training=False, augment_prob=0.4):
         self.X = X
         self.y = y
         self.training = training
         self.augment_prob = augment_prob
         self.fs = 250
+        
+        # 确保数据是torch张量
+        if not isinstance(self.X, torch.Tensor):
+            self.X = torch.FloatTensor(self.X)
+        if not isinstance(self.y, torch.Tensor):
+            self.y = torch.LongTensor(self.y)
 
     def __len__(self):
+        """返回数据集大小"""
         return len(self.X)
 
     def __getitem__(self, idx):
@@ -149,6 +157,8 @@ class EEGDataset(torch.utils.data.Dataset):
             augment_methods = [
                 self.add_noise,
                 self.random_scale,
+                self.random_time_warp,  # 确保这个方法存在
+                self.channel_dropout,
             ]
             augment = np.random.choice(augment_methods)
             x = augment(x)
@@ -164,6 +174,54 @@ class EEGDataset(torch.utils.data.Dataset):
         """随机缩放增强"""
         scale_factor = np.random.uniform(scale_range[0], scale_range[1])
         return x * scale_factor
+    
+    def random_time_warp(self, x, warp_factor=0.1):
+        """时间扭曲增强 - 简化稳定版本"""
+        if x.dim() == 3:  # (bands, channels, time)
+            bands, chans, time = x.shape
+            
+            # 生成扭曲比例
+            warp_ratio = 1.0 + np.random.uniform(-warp_factor, warp_factor)
+            new_length = int(time * warp_ratio)
+            
+            # 对每个频段和通道应用时间扭曲
+            x_warped = torch.zeros_like(x)
+            for b in range(bands):
+                for c in range(chans):
+                    signal = x[b, c, :].unsqueeze(0).unsqueeze(0)  # (1, 1, time)
+                    
+                    # 应用插值
+                    if new_length != time:
+                        signal_resized = F.interpolate(
+                            signal, 
+                            size=new_length, 
+                            mode='linear', 
+                            align_corners=False
+                        )
+                        
+                        if new_length > time:
+                            # 裁剪
+                            x_warped[b, c, :] = signal_resized[0, 0, :time]
+                        else:
+                            # 填充
+                            x_warped[b, c, :new_length] = signal_resized[0, 0, :]
+                    else:
+                        x_warped[b, c, :] = signal[0, 0, :]
+            
+            return x_warped
+        return x
+    
+    def channel_dropout(self, x, drop_prob=0.2):
+        """通道dropout增强"""
+        if x.dim() == 3:  # (bands, channels, time)
+            bands, chans, time = x.shape
+            
+            # 随机选择要丢弃的通道
+            drop_mask = (torch.rand(chans) > drop_prob).float()
+            drop_mask = drop_mask.view(1, -1, 1).expand(bands, chans, time)
+            
+            return x * drop_mask
+        return x
 
 def get_data(data_path, subject, loso=False, is_standard=True, fre_filter=True, dataset='BCI2a', use_9_bands=True):
     """获取预处理后的数据
